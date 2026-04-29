@@ -14,6 +14,7 @@ Metrics collected per run:
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -148,6 +149,17 @@ QUESTS: list[Quest] = [
 # ── metrics ──────────────────────────────────────────────────────────────────
 
 @dataclass
+class GKGSideMetrics:
+    """Diagnostic metrics computed from a gkg_nav conversation log."""
+    gkg_call_rate: float = 0.0      # GET_CODE / total nav turns
+    dead_end_rate: float = 0.0      # UNKNOWN cmd / total nav turns
+    repeat_cmd_rate: float = 0.0    # repeated consecutive cmd / total nav turns
+    cd_success_rate: float = 0.0    # CD calls not followed by an error result / total CD calls
+    get_code_count: int = 0
+    nav_turns: int = 0              # total turns including ANSWER
+
+
+@dataclass
 class RunMetrics:
     quest_id: int
     condition: str          # "baseline_full" | "baseline_nav" | "gkg_nav"
@@ -164,6 +176,12 @@ class RunMetrics:
     # LLM judge scores (filled by score_with_judge)
     judge_score: float = -1.0
     judge_reason: str = ""
+    judge_stable: bool = True       # False when two judge passes disagree by > 1/6
+    # working-rate gate (filled by score_metrics before any other scoring)
+    working_rate: float = -1.0      # 1.0=passes, 0.0=broken, -1.0=not checked
+    working_stage: str = ""         # "syntax" | "compile" | "empty" | "skip"
+    # GKG-specific side metrics (only set for gkg_nav condition)
+    gkg_side: Optional[GKGSideMetrics] = field(default=None)
     # full turn-by-turn conversation log: list of {"role", "content", "tokens"} dicts
     conversation: list = field(default_factory=list)
 
@@ -182,9 +200,11 @@ class RunMetrics:
 
     def summary(self) -> str:
         q_str = "{:.0%}".format(self.quality) if self.quality >= 0 else "?"
+        wr_str = ("OK" if self.working_rate >= 1.0
+                  else "FAIL" if self.working_rate == 0.0 else "?")
         return (
-            "{:14s}  turns={:2d}  tok={:5d}  lat={:.1f}s  q={}".format(
-                self.condition, self.turns, self.total_tokens, self.latency_s, q_str
+            "{:14s}  turns={:2d}  tok={:5d}  lat={:.1f}s  q={}  wr={}".format(
+                self.condition, self.turns, self.total_tokens, self.latency_s, q_str, wr_str
             )
         )
 
@@ -220,6 +240,21 @@ def run_ab(
     b = baseline_fn(quest)
     g = gkg_fn(quest, navigator)
     return ABResult(quest=quest, baseline=b, gkg=g)
+
+
+def composite_reward(m: RunMetrics) -> float:
+    """Gate-then-penalise reward: 0.0 if code is broken, quality minus log-scale token penalty.
+
+    Token penalty uses log10 so a 10x token increase only costs ~0.15 quality points,
+    keeping quality dominant while still favouring efficient runs.
+    """
+    if m.working_rate == 0.0:
+        return 0.0
+    q = m.quality
+    if q < 0:
+        return 0.0
+    tok_penalty = math.log10(max(m.total_tokens, 1)) / 10.0
+    return max(0.0, round(q - 0.15 * tok_penalty, 4))
 
 
 def print_report(results: list[ABResult]) -> None:

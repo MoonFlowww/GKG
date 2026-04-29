@@ -6,10 +6,12 @@ because N=6 quests is too small for t-tests to be meaningful.
 """
 from __future__ import annotations
 
+import math
 import random
 import statistics
-import math
 from typing import Sequence
+
+from ab_quests import composite_reward
 
 
 def _get_quality(m) -> float:
@@ -69,16 +71,24 @@ def significance_caveat(n_quests: int, n_runs: int = 1) -> str:
     ).format(total, needed)
 
 
+def _working_rate_str(m) -> str:
+    wr = getattr(m, "working_rate", -1.0)
+    if wr >= 1.0: return "OK"
+    if wr == 0.0: return "FAIL"
+    return "—"
+
+
 def quality_table(
     all_results: list,  # list of (bf, bn, gn) RunMetrics triples
     quests: list,
 ) -> str:
     """Print a compact quality/token/latency summary table."""
-    H = "{:28s}  {:12s}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}  {:>5}  {:>5}  {:>5}  {:>6}"
-    SEP = "-" * 118
+    H = "{:28s}  {:12s}  {:>6}  {:>6}  {:>6}  {:>4}  {:>4}  {:>4}  {:>6}  {:>6}  {:>6}  {:>5}  {:>5}  {:>5}  {:>6}"
+    SEP = "-" * 130
     header = H.format(
         "Quest", "Cplx",
         "F-qual", "N-qual", "G-qual",
+        "F-wr", "N-wr", "G-wr",
         "F-tok", "N-tok", "G-tok",
         "F-lat", "N-lat", "G-lat",
         "Winner",
@@ -108,12 +118,14 @@ def quality_table(
     bf_quals, bn_quals, gn_quals = [], [], []
     bf_toks, bn_toks, gn_toks = [], [], []
     bf_lats, bn_lats, gn_lats = [], [], []
+    bf_rewards, bn_rewards, gn_rewards = [], [], []
 
     for (bf, bn, gn), q in zip(all_results, quests):
         name = "Q{} {}".format(q.id, q.name)
         lines.append(H.format(
             name[:28], q.complexity[:12],
             _q(bf), _q(bn), _q(gn),
+            _working_rate_str(bf), _working_rate_str(bn), _working_rate_str(gn),
             bf.total_tokens, bn.total_tokens, gn.total_tokens,
             _lat(bf), _lat(bn), _lat(gn),
             _winner(bf, bn, gn),
@@ -121,6 +133,9 @@ def quality_table(
         bf_quals.append(_get_quality(bf)); bn_quals.append(_get_quality(bn)); gn_quals.append(_get_quality(gn))
         bf_toks.append(bf.total_tokens); bn_toks.append(bn.total_tokens); gn_toks.append(gn.total_tokens)
         bf_lats.append(bf.latency_s); bn_lats.append(bn.latency_s); gn_lats.append(gn.latency_s)
+        bf_rewards.append(composite_reward(bf))
+        bn_rewards.append(composite_reward(bn))
+        gn_rewards.append(composite_reward(gn))
 
     lines.append(SEP)
 
@@ -167,4 +182,35 @@ def quality_table(
         lines.append("")
 
     lines.append(significance_caveat(len(all_results)))
+
+    # working-rate pass rate (binary, most trustable metric at small N)
+    def _wr_pass_rate(results_col):
+        wrs = [getattr(m, "working_rate", -1.0) for m in results_col]
+        checked = [w for w in wrs if w >= 0]
+        if not checked:
+            return "N/A"
+        return "{:.0%}".format(sum(1 for w in checked if w >= 1.0) / len(checked))
+
+    bf_col = [bf for bf, _, _ in all_results]
+    bn_col = [bn for _, bn, _ in all_results]
+    gn_col = [gn for _, _, gn in all_results]
+
+    lines.append("")
+    lines.append("Working-rate pass (code gate, deterministic):")
+    lines.append("  full={} nav={} gkg={}".format(
+        _wr_pass_rate(bf_col), _wr_pass_rate(bn_col), _wr_pass_rate(gn_col)))
+
+    # composite reward (quality gated by working_rate, penalised by token use)
+    lines.append("")
+    lines.append("Composite reward (quality × gate − token penalty):")
+    lines.append("  full : {}".format(_ci_str(bf_rewards)))
+    lines.append("  nav  : {}".format(_ci_str(bn_rewards)))
+    lines.append("  gkg  : {}".format(_ci_str(gn_rewards)))
+
+    d_rew_nav  = effect_size(gn_rewards, bn_rewards)
+    d_rew_full = effect_size(gn_rewards, bf_rewards)
+    if not math.isnan(d_rew_nav):
+        lines.append("Cohen's d (reward): gkg vs nav={:.2f}  gkg vs full={:.2f}".format(
+            d_rew_nav, d_rew_full))
+
     return "\n".join(lines)

@@ -13,12 +13,18 @@ so the model sees a real dialogue, not a growing single-message wall.
 """
 from __future__ import annotations
 
+import ast
+import math
 import os
+import pickle
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 
-from ab_quests import Quest, RunMetrics
+from ab_quests import GKGSideMetrics, Quest, RunMetrics
 from gkg_navigator import GKGNavigator
 from ollama_client import OllamaClient
 
@@ -35,6 +41,72 @@ import re as _re
 def _tokenize(text: str) -> set[str]:
     """Extract meaningful alphanumeric tokens (len>=2, skip pure numbers)."""
     return {t for t in _re.findall(r'[A-Za-z_][A-Za-z0-9_]*', text) if len(t) >= 2}
+
+
+def detect_language(code: str) -> str:
+    """Detect primary language from code-fence tags, then structural heuristics."""
+    m = re.search(r'```(\w+)', code)
+    if m:
+        tag = m.group(1).lower()
+        if tag in ("python", "py"):
+            return "python"
+        if tag in ("cpp", "c++", "cc", "cxx", "c"):
+            return "cpp"
+    if "def " in code and ("self" in code or "import " in code):
+        return "python"
+    if "#include" in code or "::" in code:
+        return "cpp"
+    return "cpp"   # default: this project is C++
+
+
+def _extract_code_blocks(text: str) -> str:
+    """Return code-fence contents joined, or full text if no fences."""
+    blocks = re.findall(r'```[\w]*\n?(.*?)```', text, re.DOTALL)
+    return "\n\n".join(blocks) if blocks else text
+
+
+def check_working_rate(notes: str, language: str) -> dict:
+    """Syntax/compile gate. Returns {"passes": bool, "stage": str, "error": str}.
+
+    Operates on code extracted from markdown fences.
+    Currently implements: syntax (Python: ast.parse; C++: g++ -fsyntax-only).
+    """
+    if not notes or notes.startswith("["):
+        return {"passes": False, "stage": "empty", "error": "no code produced"}
+
+    code = _extract_code_blocks(notes)
+    if not code.strip():
+        return {"passes": False, "stage": "empty", "error": "no code produced"}
+
+    if language == "python":
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            return {"passes": False, "stage": "syntax", "error": str(e)[:200]}
+        return {"passes": True, "stage": "syntax", "error": ""}
+
+    if language in ("cpp", "c"):
+        if not shutil.which("g++"):
+            return {"passes": True, "stage": "skip", "error": "g++ not found"}
+        body = code if "int main" in code else "#include <cstdio>\n" + code + "\nint main(){}"
+        with tempfile.NamedTemporaryFile(suffix=".cpp", delete=False, mode="w") as f:
+            f.write(body)
+            fname = f.name
+        try:
+            r = subprocess.run(
+                ["g++", "-std=c++17", "-fsyntax-only", "-w", fname],
+                capture_output=True, timeout=10,
+            )
+        finally:
+            os.unlink(fname)
+        passes = r.returncode == 0
+        return {
+            "passes": passes,
+            "stage": "syntax",
+            "error": r.stderr.decode()[:300] if not passes else "",
+        }
+
+    return {"passes": True, "stage": "skip", "error": "unsupported language"}
 
 
 def _trim_messages(messages: list[dict]) -> list[dict]:
@@ -536,9 +608,22 @@ def _kw_score(notes: str, gen_kw: list) -> float:
     return round(hits / len(gen_kw), 3)
 
 
+_CODE_COMPLEXITIES = {"retrieval", "local_add", "cross_module", "new_feature"}
+
+
 def score_metrics(metrics: "RunMetrics", quest, navigator: "GKGNavigator") -> None:
-    """Fill recall/precision/f1 in-place."""
+    """Fill recall/precision/f1 in-place, gated by working_rate for code tasks."""
     gen_kw = getattr(quest, "gen_keywords", [])
+
+    # working-rate gate: skip for analysis (prose output, not compilable code)
+    if quest.complexity in _CODE_COMPLEXITIES:
+        lang = detect_language(metrics.notes)
+        wr = check_working_rate(metrics.notes, lang)
+        metrics.working_rate = 1.0 if wr["passes"] else 0.0
+        metrics.working_stage = wr["stage"]
+        if not wr["passes"]:
+            metrics.recall = metrics.precision = metrics.f1 = 0.0
+            return
 
     if quest.complexity == "retrieval":
         if quest.target_node is None:
@@ -595,6 +680,68 @@ def score_structural(generated_code: str, quest, navigator) -> dict:
     return {"node_coverage": round(coverage, 3), "edge_faithfulness": -1.0}
 
 
+def compute_gkg_side_metrics(metrics: "RunMetrics") -> GKGSideMetrics:
+    """Parse conversation log to compute GKG navigation diagnostics.
+
+    Conversation entries alternate: assistant (with "cmd" key) then tool (role="tool").
+    The final ANSWER turn has no following tool entry.
+    """
+    sm = GKGSideMetrics()
+    conv = metrics.conversation
+    if not conv:
+        return sm
+
+    # Build (cmd_str, tool_result) pairs from the interleaved log
+    nav_entries: list[tuple[str, str]] = []
+    i = 0
+    while i < len(conv):
+        entry = conv[i]
+        if entry.get("role") == "assistant" and "cmd" in entry:
+            cmd = entry["cmd"]
+            if i + 1 < len(conv) and conv[i + 1].get("role") == "tool":
+                nav_entries.append((cmd, conv[i + 1].get("content", "")))
+                i += 2
+            else:
+                nav_entries.append((cmd, ""))   # ANSWER or orphaned turn
+                i += 1
+        else:
+            i += 1
+
+    sm.nav_turns = len(nav_entries)
+    if not nav_entries:
+        return sm
+
+    get_code_count = 0
+    unknown_count = 0
+    repeat_count = 0
+    cd_entries: list[tuple[str, str]] = []
+
+    for j, (cmd, result) in enumerate(nav_entries):
+        cu = cmd.upper()
+        if cu.startswith("GET_CODE"):
+            get_code_count += 1
+        if cu.startswith("UNKNOWN"):
+            unknown_count += 1
+        if cu.startswith("CD"):
+            cd_entries.append((cmd, result))
+        if j > 0 and cmd == nav_entries[j - 1][0]:
+            repeat_count += 1
+
+    _error_markers = ("error", "not found", "unknown command", "[unknown")
+    cd_success = sum(
+        1 for _, res in cd_entries
+        if res and not any(m in res.lower() for m in _error_markers)
+    )
+
+    n = sm.nav_turns
+    sm.get_code_count = get_code_count
+    sm.gkg_call_rate = round(get_code_count / n, 3)
+    sm.dead_end_rate = round(unknown_count / n, 3)
+    sm.repeat_cmd_rate = round(repeat_count / max(n - 1, 1), 3) if n > 1 else 0.0
+    sm.cd_success_rate = round(cd_success / len(cd_entries), 3) if cd_entries else 0.0
+    return sm
+
+
 # ── LLM judge ────────────────────────────────────────────────────────────────
 
 JUDGE_MODEL = "gemma4:26b"
@@ -633,14 +780,78 @@ def judge_answer(quest, answer: str, judge_client: "OllamaClient") -> dict:
     return {"score": -1.0, "reason": "parse_error:" + raw[:40]}
 
 
+_JUDGE_SYS_V2 = """\
+You are a strict code reviewer. Score ONLY against the rubric below. Output JSON only — no prose.
+{"correctness": 0|1|2, "completeness": 0|1|2, "no_hallucination": 0|1|2, "reason": "one sentence"}
+
+Rubric:
+  correctness:      2=fully correct logic, 1=mostly correct with minor errors, 0=wrong or broken
+  completeness:     2=all required elements present, 1=partial, 0=missing key parts
+  no_hallucination: 2=only references real constructs, 1=minor invented names, 0=fabricated API
+"""
+
+
+def judge_answer_v2(quest, answer: str, judge_client: "OllamaClient",
+                    swap_check: bool = True) -> dict:
+    """Three-dimension rubric judge with stability check.
+
+    Runs the judge twice; if normalised scores differ by more than 1/6 (one rubric
+    point), the result is flagged unstable and the average is returned.
+    Returns {"score": float 0–1, "stable": bool, "reason": str}.
+    """
+    import json as _json
+    if not answer or answer.startswith("["):
+        return {"score": 0.0, "stable": True, "reason": "no answer produced"}
+
+    blocks = re.findall(r'```[\w]*\n?(.*?)```', answer, re.DOTALL)
+    excerpt = "\n".join(blocks)[:2000] if blocks else answer[:1500]
+
+    prompt = "TASK: {}\n\nCRITERIA: {}\n\nCODE:\n{}".format(
+        quest.prompt[:300], quest.success_criteria[:200], excerpt
+    )
+
+    def _call(p: str) -> tuple[dict, float]:
+        try:
+            raw = judge_client.complete(p, system=_JUDGE_SYS_V2,
+                                        max_tokens=120, label="judge2_q{}".format(quest.id))
+            m = re.search(r'\{[^}]+\}', raw, re.DOTALL)
+            if m:
+                d = _json.loads(m.group())
+                total = (d.get("correctness", 0)
+                         + d.get("completeness", 0)
+                         + d.get("no_hallucination", 0))
+                return d, round(total / 6.0, 4)
+        except Exception as e:
+            return {"reason": str(e)}, -1.0
+        return {}, -1.0
+
+    d_a, score_a = _call(prompt)
+    if score_a < 0:
+        return {"score": -1.0, "stable": False, "reason": "parse_error"}
+
+    if swap_check:
+        _, score_b = _call(prompt + "\n[Re-evaluate independently]")
+        if score_b >= 0 and abs(score_a - score_b) > (1 / 6.0 + 0.001):
+            avg = round((score_a + score_b) / 2.0, 4)
+            return {"score": avg, "stable": False,
+                    "reason": (d_a.get("reason", "") or "") + " [unstable]"}
+
+    return {"score": score_a, "stable": True, "reason": d_a.get("reason", "")}
+
+
 def score_with_judge(metrics: "RunMetrics", quest, judge_client=None) -> None:
-    """Judge scoring with structured fallback when judge unavailable or fails."""
+    """Judge scoring with structured fallback when judge unavailable or fails.
+
+    Uses judge_answer_v2 (3-dimension rubric + stability check) when a client
+    is available; falls back to deterministic heuristics otherwise.
+    """
     if judge_client is not None:
-        result = judge_answer(quest, metrics.notes, judge_client)
+        result = judge_answer_v2(quest, metrics.notes, judge_client)
         score = result.get("score", -1.0)
         if score >= 0:
             metrics.judge_score = score
             metrics.judge_reason = result.get("reason", "")
+            metrics.judge_stable = result.get("stable", True)
             return
 
     # Fallback: synthesize from existing deterministic scores
@@ -685,8 +896,10 @@ def run_quest_ab(quest, client, project_path, navigator, judge_client=None):
     print("  [gkg]   Q{}: {} ...".format(quest.id, quest.name))
     gn = run_gkg_nav(quest, client, navigator)
     score_metrics(gn, quest, navigator)
-    print("    turns={} tok={} lat={:.1f}s f1={}".format(
-        gn.turns, gn.total_tokens, gn.latency_s, _f1_prog(gn.f1)))
+    gn.gkg_side = compute_gkg_side_metrics(gn)
+    print("    turns={} tok={} lat={:.1f}s f1={} wr={}".format(
+        gn.turns, gn.total_tokens, gn.latency_s, _f1_prog(gn.f1),
+        "OK" if gn.working_rate >= 1.0 else "FAIL" if gn.working_rate == 0.0 else "?"))
 
     if judge_client is not None:
         print("  [judge] Q{} ...".format(quest.id))
@@ -697,3 +910,27 @@ def run_quest_ab(quest, client, project_path, navigator, judge_client=None):
             max(bf.judge_score, 0), max(bn.judge_score, 0), max(gn.judge_score, 0)))
 
     return bf, bn, gn
+
+
+# ── GKG graph cache ───────────────────────────────────────────────────────────
+
+_GKG_CACHE_PATH = "_gkg_cache.pkl"
+
+
+def load_or_build_gkg(repo_path: str, cache_path: str = _GKG_CACHE_PATH):
+    """Load a pickled GKG graph or build it fresh and cache it.
+
+    Building via map_project is deterministic (pure AST parse, no LLM) but
+    slow on large repos. Caching ensures repeated eval runs are identical and
+    fast. Delete the cache file to force a rebuild.
+    """
+    p = Path(cache_path)
+    if p.exists():
+        with open(p, "rb") as f:
+            return pickle.load(f)
+
+    from ast_mapper import map_project
+    g = map_project(repo_path)
+    with open(p, "wb") as f:
+        pickle.dump(g, f)
+    return g
