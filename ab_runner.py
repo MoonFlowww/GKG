@@ -564,6 +564,37 @@ def score_metrics(metrics: "RunMetrics", quest, navigator: "GKGNavigator") -> No
             )
 
 
+def score_structural(generated_code: str, quest, navigator) -> dict:
+    """Compare generated code's GKG against expected blueprint nodes."""
+    import tempfile, os
+    if not generated_code or quest.target_node is None:
+        return {"node_coverage": 0.0, "edge_faithfulness": 0.0}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fpath = os.path.join(tmp, "generated.py")
+        with open(fpath, "w") as f:
+            f.write(generated_code)
+        try:
+            from ast_mapper import map_project
+            gen_graph = map_project(tmp)
+        except Exception:
+            return {"node_coverage": 0.0, "edge_faithfulness": 0.0}
+
+    gen_names = {n.name.split("::")[-1].split(".")[-1].lower()
+                 for n in gen_graph.nodes.values()}
+    expected = navigator.find(quest.target_node)
+    expected_names = {
+        line.strip().split("—")[0].strip().lower()
+        for line in expected.splitlines()[1:]
+        if line.strip()
+    }
+    if not expected_names:
+        return {"node_coverage": 0.0, "edge_faithfulness": 0.0}
+
+    coverage = len(gen_names & expected_names) / len(expected_names)
+    return {"node_coverage": round(coverage, 3), "edge_faithfulness": -1.0}
+
+
 # ── LLM judge ────────────────────────────────────────────────────────────────
 
 JUDGE_MODEL = "gemma4:26b"
@@ -578,28 +609,53 @@ score: 1.0=fully correct and complete, 0.5=partially correct or incomplete, 0.0=
 def judge_answer(quest, answer: str, judge_client: "OllamaClient") -> dict:
     """Score answer using a thinking LLM judge. Returns {"score": float, "reason": str}."""
     import json as _json
+    import re as _re
     if not answer or answer.startswith("["):
         return {"score": 0.0, "reason": "no answer produced"}
+
+    # Trim to code blocks only — judge sees the diff, not noise
+    blocks = _re.findall(r'```[\w]*\n?(.*?)```', answer, _re.DOTALL)
+    code_excerpt = "\n".join(blocks)[:2000] if blocks else answer[:1500]
+
     prompt = (
-        "TASK: {}\n\nSUCCESS CRITERIA:\n{}\n\nANSWER:\n{}\n\n"
-        "Score this answer with JSON only."
-    ).format(quest.prompt, quest.success_criteria, answer[:3000])
+        "TASK: {}\n\nCRITERIA: {}\n\nCODE:\n{}\n\n"
+        "Reply ONLY with: {{\"score\": 0.0|0.5|1.0, \"reason\": \"one sentence\"}}"
+    ).format(quest.prompt[:300], quest.success_criteria[:200], code_excerpt)
+
     try:
         raw = judge_client.complete(prompt, system=_JUDGE_SYS,
-                                    max_tokens=200, label="judge_q{}".format(quest.id))
+                                    max_tokens=80, label="judge_q{}".format(quest.id))
         m = re.search(r'\{[^}]+\}', raw, re.DOTALL)
         if m:
             return _json.loads(m.group())
     except Exception as e:
         return {"score": -1.0, "reason": str(e)}
-    return {"score": -1.0, "reason": "parse error: " + raw[:80]}
+    return {"score": -1.0, "reason": "parse_error:" + raw[:40]}
 
 
-def score_with_judge(metrics: "RunMetrics", quest, judge_client: "OllamaClient") -> None:
-    """Run LLM judge and fill metrics.judge_score / metrics.judge_reason in-place."""
-    result = judge_answer(quest, metrics.notes, judge_client)
-    metrics.judge_score  = result.get("score", -1.0)
-    metrics.judge_reason = result.get("reason", "")
+def score_with_judge(metrics: "RunMetrics", quest, judge_client=None) -> None:
+    """Judge scoring with structured fallback when judge unavailable or fails."""
+    if judge_client is not None:
+        result = judge_answer(quest, metrics.notes, judge_client)
+        score = result.get("score", -1.0)
+        if score >= 0:
+            metrics.judge_score = score
+            metrics.judge_reason = result.get("reason", "")
+            return
+
+    # Fallback: synthesize from existing deterministic scores
+    gen_kw = getattr(quest, "gen_keywords", [])
+    if quest.complexity == "retrieval":
+        metrics.judge_score = metrics.f1 if metrics.f1 >= 0 else 0.0
+        metrics.judge_reason = "fallback:f1"
+    elif gen_kw and metrics.notes:
+        kw = _kw_score(metrics.notes, gen_kw)
+        f1 = max(metrics.f1, 0.0)
+        metrics.judge_score = round(0.4 * f1 + 0.6 * kw, 3)
+        metrics.judge_reason = f"fallback:kw={kw:.2f},f1={f1:.2f}"
+    else:
+        metrics.judge_score = 0.0
+        metrics.judge_reason = "fallback:no-signal"
 
 
 def _qual_str(m: "RunMetrics") -> str:

@@ -12,6 +12,17 @@ import math
 from typing import Sequence
 
 
+def _get_quality(m) -> float:
+    """Kernel-safe quality accessor — doesn't rely on @property surviving reimport."""
+    if hasattr(m, 'quality') and callable(getattr(type(m), 'quality', None)):
+        return m.quality
+    judge = getattr(m, 'judge_score', -1.0)
+    f1    = getattr(m, 'f1', -1.0)
+    if judge >= 0: return judge
+    if f1 >= 0:    return f1
+    return -1.0
+
+
 def bootstrap_ci(
     values: Sequence[float],
     n_boot: int = 2000,
@@ -74,14 +85,14 @@ def quality_table(
     )
 
     def _q(m) -> str:
-        v = m.quality
+        v = _get_quality(m)
         return "{:.0%}".format(v) if v >= 0 else "?"
 
     def _lat(m) -> str:
         return "{:.0f}s".format(m.latency_s) if m.latency_s > 0 else "?"
 
     def _winner(bf, bn, gn) -> str:
-        scores = [("F", bf.quality), ("N", bn.quality), ("G", gn.quality)]
+        scores = [("F", _get_quality(bf)), ("N", _get_quality(bn)), ("G", _get_quality(gn))]
         valid = [(c, s) for c, s in scores if s >= 0]
         if not valid:
             return "?"
@@ -107,7 +118,7 @@ def quality_table(
             _lat(bf), _lat(bn), _lat(gn),
             _winner(bf, bn, gn),
         ))
-        bf_quals.append(bf.quality); bn_quals.append(bn.quality); gn_quals.append(gn.quality)
+        bf_quals.append(_get_quality(bf)); bn_quals.append(_get_quality(bn)); gn_quals.append(_get_quality(gn))
         bf_toks.append(bf.total_tokens); bn_toks.append(bn.total_tokens); gn_toks.append(gn.total_tokens)
         bf_lats.append(bf.latency_s); bn_lats.append(bn.latency_s); gn_lats.append(gn.latency_s)
 
